@@ -6,7 +6,7 @@ from typing import Any
 
 import joblib
 import pandas as pd
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from huggingface_hub import hf_hub_download
 from pydantic import BaseModel, Field
 
@@ -78,6 +78,15 @@ def ensure_model_loaded() -> None:
         raise HTTPException(status_code=503, detail="Model unavailable")
 
 
+def authorize_reload_request(x_api_token: str | None) -> None:
+    expected_token = os.getenv("RELOAD_TOKEN")
+    if not expected_token:
+        logger.error("RELOAD_TOKEN is not configured")
+        raise HTTPException(status_code=503, detail="Reload is not configured")
+    if x_api_token != expected_token:
+        raise HTTPException(status_code=401, detail="Invalid API token")
+
+
 def fetch_future_events(start_dt: date, end_dt: date) -> dict[str, Any]:
     url = os.getenv("SUPABASE_URL")
     key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANON_KEY")
@@ -133,13 +142,16 @@ def root():
 
 
 @app.post("/reload")
-def reload_model():
+def reload_model(x_api_token: str | None = Header(default=None)):
+    authorize_reload_request(x_api_token)
+    logger.info("Reload endpoint called; reloading model from Hugging Face")
     load_model_from_huggingface()
     if MODEL is None:
         raise HTTPException(
             status_code=503,
             detail=f"Model reload failed: {MODEL_LOAD_ERROR}",
         )
+    logger.info("Model reload completed successfully")
     return {"status": "reloaded"}
 
 
