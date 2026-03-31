@@ -373,10 +373,16 @@ def create_feedback(payload: FeedbackRequest):
     }
 
     try:
-        inserted = client.table("actual_vs_predicted").insert(row).execute().data or []
+        inserted = (
+            client.table("actual_vs_predicted")
+            .upsert(row, on_conflict="date")
+            .execute()
+            .data
+            or []
+        )
     except Exception as exc:
         logger.exception("Failed to store feedback row: %s", exc)
-        raise HTTPException(status_code=500, detail="Failed to store feedback") from exc
+        raise HTTPException(status_code=500, detail=f"Failed to store feedback: {exc}") from exc
 
     return {
         "status": "feedback_stored",
