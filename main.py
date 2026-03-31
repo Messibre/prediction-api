@@ -6,7 +6,7 @@ from typing import Any
 
 import joblib
 import pandas as pd
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Query
 from huggingface_hub import hf_hub_download
 from pydantic import BaseModel, Field
 
@@ -230,7 +230,7 @@ def fetch_overrides_by_date(client, start_dt: date, end_dt: date) -> dict[str, d
     return overrides_by_date
 
 
-def predict_rooms_for_date(target_date: date) -> tuple[float, bool]:
+def predict_rooms_for_date(target_date: date, include_override: bool = True) -> tuple[float, bool]:
     ensure_model_loaded()
     future_df = pd.DataFrame({"ds": [pd.Timestamp(target_date)]})
     forecast_df = MODEL.predict(future_df)
@@ -245,15 +245,16 @@ def predict_rooms_for_date(target_date: date) -> tuple[float, bool]:
     predicted_rooms = max(0.0, float(forecast_df.iloc[0]["yhat"]))
     overridden = False
 
-    try:
-        client = get_supabase_client()
-        overrides_by_date = fetch_overrides_by_date(client, target_date, target_date)
-        override = overrides_by_date.get(target_date.isoformat())
-        if override is not None:
-            predicted_rooms = max(0.0, float(override.get("new_prediction", predicted_rooms)))
-            overridden = True
-    except HTTPException:
-        pass
+    if include_override:
+        try:
+            client = get_supabase_client()
+            overrides_by_date = fetch_overrides_by_date(client, target_date, target_date)
+            override = overrides_by_date.get(target_date.isoformat())
+            if override is not None:
+                predicted_rooms = max(0.0, float(override.get("new_prediction", predicted_rooms)))
+                overridden = True
+        except HTTPException:
+            pass
 
     return predicted_rooms, overridden
 
@@ -329,16 +330,18 @@ def reload_model(x_api_token: str | None = Header(default=None)):
 @app.post("/override")
 def create_override(payload: OverrideRequest):
     client = get_supabase_client()
+    original_prediction, _ = predict_rooms_for_date(payload.date, include_override=False)
 
     override_row = {
         "date": payload.date.isoformat(),
+        "original_prediction": round(original_prediction, 2),
         "new_prediction": float(payload.new_prediction),
         "reason": payload.reason,
         "created_by": payload.created_by,
     }
 
     try:
-        inserted = client.table("forecast_overrides").insert(override_row).execute().data or []
+        inserted = client.table("forecast_overrides").upsert(override_row).execute().data or []
     except Exception as exc:
         logger.exception("Failed to store forecast override: %s", exc)
         raise HTTPException(status_code=500, detail="Failed to store override") from exc
@@ -359,13 +362,13 @@ def create_override(payload: OverrideRequest):
 def create_feedback(payload: FeedbackRequest):
     client = get_supabase_client()
     predicted_rooms, is_overridden = predict_rooms_for_date(payload.date)
-    actual_rooms_sold = float(payload.actual_rooms_sold)
-    error = actual_rooms_sold - predicted_rooms
+    actual_value = float(payload.actual_rooms_sold)
+    error = actual_value - predicted_rooms
 
     row = {
         "date": payload.date.isoformat(),
-        "actual_rooms_sold": actual_rooms_sold,
-        "predicted_rooms": round(predicted_rooms, 2),
+        "predicted": round(predicted_rooms, 2),
+        "actual": actual_value,
         "error": round(error, 2),
     }
 
@@ -477,4 +480,26 @@ def forecast(payload: ForecastRequest):
         "event_adjustment_pct": event_impact_pct,
         "event_note": event_note,
         "predictions": results,
+    }
+
+
+@app.get("/forecast/today")
+def forecast_today(
+    include_staffing: bool = True,
+    total_rooms: int = Query(default=60, ge=1),
+):
+    result = forecast(
+        ForecastRequest(
+            horizon_days=1,
+            include_staffing=include_staffing,
+            total_rooms=total_rooms,
+        )
+    )
+
+    today_prediction = result["predictions"][0]
+    return {
+        "date": today_prediction["date"],
+        "prediction": today_prediction,
+        "event_adjustment_applied": result["event_adjustment_applied"],
+        "event_note": result["event_note"],
     }
