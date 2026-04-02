@@ -1,7 +1,7 @@
 services:
   - type: web
     name: prediction-api
-    env: python
+    runtime: python
     rootDir: .
     plan: free
     autoDeploy: true

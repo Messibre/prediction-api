@@ -72,6 +72,71 @@ class FeedbackRequest(BaseModel):
     actual_rooms_sold: float = Field(ge=0)
 
 
+class StaffCreateRequest(BaseModel):
+    name: str = Field(min_length=1)
+    email: str = Field(min_length=3)
+    department: str = Field(min_length=1)
+    role: str | None = None
+    hourly_rate: float = Field(gt=0)
+    availability: dict[str, Any] | None = None
+
+
+class StaffUpdateRequest(BaseModel):
+    name: str | None = None
+    email: str | None = None
+    department: str | None = None
+    role: str | None = None
+    hourly_rate: float | None = None
+    availability: dict[str, Any] | None = None
+
+
+class ScheduleCreateRequest(BaseModel):
+    staff_id: int
+    date: date
+    shift_start: str
+    shift_end: str
+    department: str
+    created_by: str | None = None
+
+
+class ScheduleQueryRequest(BaseModel):
+    start_date: date
+    end_date: date
+
+
+class PricingRuleUpdateRequest(BaseModel):
+    room_type: str
+    base_rate: float
+    low_demand_multiplier: float
+    medium_demand_multiplier: float
+    high_demand_multiplier: float
+    weekend_multiplier: float
+    holiday_multiplier: float
+    is_active: bool = True
+
+
+class PricingSuggestRequest(BaseModel):
+    date: date
+    room_type: str
+    lead_days: int | None = None
+
+
+class PricingApproveRequest(BaseModel):
+    date: date
+    room_type: str
+    approved_price: float
+
+
+class PromotionRequest(BaseModel):
+    title: str
+    description: str | None = None
+    start_date: date
+    end_date: date
+    discount_percent: float = Field(gt=0, le=100)
+    room_types: list[str] | None = None
+    is_active: bool = True
+
+
 def load_model_from_huggingface() -> None:
     global MODEL, MODEL_LOAD_ERROR
 
@@ -509,3 +574,207 @@ def forecast_today(
         "event_adjustment_applied": result["event_adjustment_applied"],
         "event_note": result["event_note"],
     }
+
+
+def _get_staff_row(client, staff_id: int) -> dict[str, Any] | None:
+    row = (
+        client.table("staff")
+        .select("*")
+        .eq("staff_id", staff_id)
+        .single() 
+        .execute()
+        .data
+    )
+    return row
+
+
+@app.get("/admin/staff")
+def list_staff():
+    client = get_supabase_client()
+    rows = client.table("staff").select("*").eq("is_active", True).execute().data or []
+    return {"staff": rows}
+
+
+@app.post("/admin/staff")
+def create_staff(payload: StaffCreateRequest):
+    client = get_supabase_client()
+    row = payload.dict()
+    row["is_active"] = True
+    row["created_at"] = pd.Timestamp.now().isoformat()
+    try:
+        inserted = client.table("staff").insert(row).execute().data or []
+    except Exception as exc:
+        logger.exception("Failed to create staff: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to create staff") from exc
+    return {"staff_id": inserted[0].get("staff_id"), "success": True}
+
+
+@app.put("/admin/staff/{staff_id}")
+def update_staff(staff_id: int, payload: StaffUpdateRequest):
+    client = get_supabase_client()
+    existing = _get_staff_row(client, staff_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Staff not found")
+    data = {k: v for k, v in payload.dict(exclude_none=True).items()}
+    try:
+        client.table("staff").update(data).eq("staff_id", staff_id).execute()
+    except Exception as exc:
+        logger.exception("Failed to update staff: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to update staff") from exc
+    return {"success": True}
+
+
+@app.delete("/admin/staff/{staff_id}")
+def deactivate_staff(staff_id: int):
+    client = get_supabase_client()
+    if not _get_staff_row(client, staff_id):
+        raise HTTPException(status_code=404, detail="Staff not found")
+    try:
+        client.table("staff").update({"is_active": False}).eq("staff_id", staff_id).execute()
+    except Exception as exc:
+        logger.exception("Failed to deactivate staff: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to deactivate staff") from exc
+    return {"success": True}
+
+
+@app.get("/admin/schedule")
+def get_schedule(start_date: date, end_date: date):
+    client = get_supabase_client()
+    rows = (
+        client.table("staff_schedule")
+        .select("*,staff(name,email,department)")
+        .gte("date", start_date.isoformat())
+        .lte("date", end_date.isoformat())
+        .execute().data or []
+    )
+    return {"schedule": rows}
+
+
+@app.post("/admin/schedule/generate")
+def generate_schedule(payload: ScheduleQueryRequest):
+    # Simplified schedule generation: round robin active staff per day.
+    client = get_supabase_client()
+    staff = client.table("staff").select("*").eq("is_active", True).execute().data or []
+    if not staff:
+        raise HTTPException(status_code=404, detail="No active staff")
+    dates = pd.date_range(start=payload.start_date, end=payload.end_date)
+    schedule = []
+    idx = 0
+    for dt in dates:
+        member = staff[idx % len(staff)]
+        shift = {
+            "staff_id": member["staff_id"],
+            "date": dt.date().isoformat(),
+            "shift_start": "08:00",
+            "shift_end": "16:00",
+            "department": member.get("department"),
+            "created_by": "system",
+        }
+        schedule.append(shift)
+        idx += 1
+    return {"schedule": schedule, "success": True}
+
+
+@app.put("/admin/schedule")
+def update_schedule(schedule_id: int, shift_start: str, shift_end: str):
+    client = get_supabase_client()
+    row = client.table("staff_schedule").select("*").eq("id", schedule_id).single().execute().data
+    if not row:
+        raise HTTPException(status_code=404, detail="Schedule entry not found")
+    try:
+        client.table("staff_schedule").update({"shift_start": shift_start, "shift_end": shift_end}).eq("id", schedule_id).execute()
+    except Exception as exc:
+        logger.exception("Failed to update schedule: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to update schedule") from exc
+    return {"success": True}
+
+
+@app.post("/admin/schedule/publish")
+def publish_schedule(payload: ScheduleQueryRequest):
+    # Placeholder for email logic.
+    client = get_supabase_client()
+    staff = client.table("staff").select("email").eq("is_active", True).execute().data or []
+    emails = [row.get("email") for row in staff if row.get("email")]
+    return {"emailed": emails, "success": True}
+
+
+@app.get("/admin/pricing-rules")
+def get_pricing_rules():
+    client = get_supabase_client()
+    rows = client.table("pricing_rules").select("*").execute().data or []
+    return {"rules": rows}
+
+
+@app.put("/admin/pricing-rules")
+def update_pricing_rules(payload: PricingRuleUpdateRequest):
+    client = get_supabase_client()
+    data = payload.dict()
+    room_type = data.pop("room_type")
+    existing = client.table("pricing_rules").select("*").eq("room_type", room_type).single().execute().data
+    try:
+        if existing:
+            client.table("pricing_rules").update(data).eq("room_type", room_type).execute()
+        else:
+            client.table("pricing_rules").insert({"room_type": room_type, **data}).execute()
+    except Exception as exc:
+        logger.exception("Failed to apply pricing rules: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to apply pricing rules") from exc
+    return {"success": True}
+
+
+@app.post("/pricing/suggest")
+def suggest_pricing(payload: PricingSuggestRequest):
+    client = get_supabase_client()
+    rules = client.table("pricing_rules").select("*").eq("room_type", payload.room_type).single().execute().data
+    if not rules:
+        raise HTTPException(status_code=404, detail="Pricing rules not found")
+    # simplified demand multiplier (real logic would use forecast/no events/booking activity)
+    demand_multiplier = rules.get("medium_demand_multiplier", 1.0)
+    base_rate = float(rules.get("base_rate", 0))
+    weekend_multiplier = rules.get("weekend_multiplier", 1.0)
+    holiday_multiplier = rules.get("holiday_multiplier", 1.0)
+    final_price = base_rate * demand_multiplier * weekend_multiplier * holiday_multiplier
+    return {
+        "suggested_price": round(final_price, 2),
+        "breakdown": {
+            "base_rate": base_rate,
+            "demand_multiplier": demand_multiplier,
+            "weekend_multiplier": weekend_multiplier,
+            "holiday_multiplier": holiday_multiplier,
+            "final": round(final_price, 2),
+        },
+    }
+
+
+@app.post("/pricing/approve")
+def approve_pricing(payload: PricingApproveRequest):
+    client = get_supabase_client()
+    row = payload.dict()
+    row["created_at"] = pd.Timestamp.now().isoformat()
+    try:
+        client.table("pricing_approvals").upsert(row, on_conflict="date,room_type").execute()
+    except Exception as exc:
+        logger.exception("Failed to approve pricing: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to approve pricing") from exc
+    return {"success": True}
+
+
+@app.post("/promotions")
+def create_promotion(payload: PromotionRequest):
+    client = get_supabase_client()
+    row = payload.dict()
+    row["created_at"] = pd.Timestamp.now().isoformat()
+    try:
+        client.table("promotions").insert(row).execute()
+    except Exception as exc:
+        logger.exception("Failed to create promotion: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to create promotion") from exc
+    return {"success": True}
+
+
+@app.get("/promotions")
+def list_promotions():
+    client = get_supabase_client()
+    rows = client.table("promotions").select("*").execute().data or []
+    return {"promotions": rows}
+
