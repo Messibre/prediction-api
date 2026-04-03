@@ -10,6 +10,7 @@ from fastapi import FastAPI, Header, HTTPException, Query
 from huggingface_hub import hf_hub_download
 from pydantic import BaseModel, Field
 
+from admin_extensions import create_admin_extensions_router, create_notification, log_action
 from chat_rag import create_chat_router
 
 app = FastAPI()
@@ -201,6 +202,7 @@ def get_supabase_client():
 
 
 app.include_router(create_chat_router(get_supabase_client))
+app.include_router(create_admin_extensions_router(get_supabase_client, lambda: MODEL is not None))
 
 
 def ensure_default_staffing_rules(client) -> None:
@@ -421,6 +423,25 @@ def create_override(payload: OverrideRequest):
         "override": inserted[0] if inserted else override_row,
     }
 
+    create_notification(
+        client,
+        payload.created_by,
+        "override_confirmed",
+        "Override Saved",
+        f"Forecast override for {payload.date.isoformat()} saved. New prediction: {float(payload.new_prediction):.2f}.",
+        "/staff",
+    )
+    log_action(
+        client,
+        payload.created_by,
+        "created_override",
+        {
+            "date": payload.date.isoformat(),
+            "new_prediction": float(payload.new_prediction),
+            "reason": payload.reason,
+        },
+    )
+
     if payload.include_staffing:
         rules = fetch_staffing_rules(client)
         response["staffing"] = calculate_staffing(float(payload.new_prediction), rules)
@@ -514,6 +535,27 @@ def create_feedback(payload: dict[str, Any]):
     except Exception as exc:
         logger.exception("Failed to store guest feedback row: %s", exc)
         raise HTTPException(status_code=500, detail="Failed to store feedback") from exc
+
+    if str(row.get("sentiment") or "").lower() == "negative":
+        create_notification(
+            client,
+            os.getenv("ADMIN_EMAIL", "admin@resort.com"),
+            "negative_feedback",
+            "New Negative Feedback",
+            f"Guest {row.get('guest_name')} left a {row.get('rating')}-star review: {str(row.get('comment'))[:120]}",
+            "/feedback",
+        )
+
+    log_action(
+        client,
+        os.getenv("ADMIN_EMAIL", "admin@resort.com"),
+        "created_feedback",
+        {
+            "date": row.get("date"),
+            "sentiment": row.get("sentiment"),
+            "rating": row.get("rating"),
+        },
+    )
 
     return {
         "success": True,
@@ -799,6 +841,26 @@ def publish_schedule(payload: ScheduleQueryRequest):
     client = get_supabase_client()
     staff = client.table("staff").select("email").eq("is_active", True).execute().data or []
     emails = [row.get("email") for row in staff if row.get("email")]
+
+    admin_email = os.getenv("ADMIN_EMAIL", "admin@resort.com")
+    create_notification(
+        client,
+        admin_email,
+        "schedule_published",
+        "Schedule Published",
+        f"The staff schedule from {payload.start_date.isoformat()} to {payload.end_date.isoformat()} has been published and emailed to all staff.",
+        "/scheduling",
+    )
+    log_action(
+        client,
+        admin_email,
+        "published_schedule",
+        {
+            "start_date": payload.start_date.isoformat(),
+            "end_date": payload.end_date.isoformat(),
+            "emailed_count": len(emails),
+        },
+    )
     return {"emailed": emails, "success": True}
 
 
@@ -860,6 +922,17 @@ def approve_pricing(payload: PricingApproveRequest):
     except Exception as exc:
         logger.exception("Failed to approve pricing: %s", exc)
         raise HTTPException(status_code=500, detail="Failed to approve pricing") from exc
+
+    log_action(
+        client,
+        os.getenv("ADMIN_EMAIL", "admin@resort.com"),
+        "approved_pricing",
+        {
+            "date": payload.date.isoformat(),
+            "room_type": payload.room_type,
+            "approved_price": float(payload.approved_price),
+        },
+    )
     return {"success": True}
 
 

@@ -8,3 +8,4 @@ supabase==2.11.0
 python-multipart==0.0.20
 google-genai
 websockets
+reportlab
