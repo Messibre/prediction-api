@@ -1,6 +1,6 @@
 import logging
 import os
-from datetime import date
+from datetime import date, timedelta
 from math import ceil
 from typing import Any
 
@@ -423,36 +423,96 @@ def create_override(payload: OverrideRequest):
     return response
 
 
-@app.post("/feedback")
-def create_feedback(payload: FeedbackRequest):
+@app.get("/feedback")
+def list_feedback(
+    sentiment: str | None = Query(default=None),
+    start_date: date | None = Query(default=None),
+    end_date: date | None = Query(default=None),
+):
     client = get_supabase_client()
-    predicted_rooms, is_overridden = predict_rooms_for_date(payload.date)
-    actual_value = float(payload.actual_rooms_sold)
-    error = actual_value - predicted_rooms
+    table_name = os.getenv("SUPABASE_GUEST_FEEDBACK_TABLE", "feedback")
 
+    try:
+        query = client.table(table_name).select("*")
+        if sentiment is not None:
+            query = query.eq("sentiment", sentiment)
+        if start_date is not None:
+            query = query.gte("date", start_date.isoformat())
+        if end_date is not None:
+            query = query.lte("date", end_date.isoformat())
+        rows = query.execute().data or []
+    except Exception as exc:
+        logger.exception("Failed to list guest feedback: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to list feedback") from exc
+
+    return {"feedback": rows}
+
+
+@app.post("/feedback")
+def create_feedback(payload: dict[str, Any]):
+    client = get_supabase_client()
+
+    # Compatibility mode for forecast-accuracy feedback payload.
+    if "actual_rooms_sold" in payload:
+        try:
+            parsed = FeedbackRequest(**payload)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"Invalid feedback payload: {exc}") from exc
+
+        predicted_rooms, is_overridden = predict_rooms_for_date(parsed.date)
+        actual_value = float(parsed.actual_rooms_sold)
+        error = actual_value - predicted_rooms
+
+        row = {
+            "date": parsed.date.isoformat(),
+            "predicted": round(predicted_rooms, 2),
+            "actual": actual_value,
+            "error": round(error, 2),
+        }
+
+        try:
+            inserted = (
+                client.table("actual_vs_predicted")
+                .upsert(row, on_conflict="date")
+                .execute()
+                .data
+                or []
+            )
+        except Exception as exc:
+            logger.exception("Failed to store forecast feedback row: %s", exc)
+            raise HTTPException(status_code=500, detail="Failed to store feedback") from exc
+
+        return {
+            "success": True,
+            "status": "feedback_stored",
+            "feedback": inserted[0] if inserted else row,
+            "is_overridden_prediction": is_overridden,
+        }
+
+    # Guest feedback mode for dashboard feedback page.
+    if "date" not in payload or "rating" not in payload or "comment" not in payload:
+        raise HTTPException(status_code=422, detail="Missing required guest feedback fields")
+
+    table_name = os.getenv("SUPABASE_GUEST_FEEDBACK_TABLE", "feedback")
     row = {
-        "date": payload.date.isoformat(),
-        "predicted": round(predicted_rooms, 2),
-        "actual": actual_value,
-        "error": round(error, 2),
+        "date": str(payload.get("date")),
+        "guest_name": payload.get("guest_name") or "Anonymous",
+        "rating": float(payload.get("rating")),
+        "comment": str(payload.get("comment")),
+        "sentiment": payload.get("sentiment") or "neutral",
+        "source": payload.get("source") or "admin",
+        "created_at": pd.Timestamp.now().isoformat(),
     }
 
     try:
-        inserted = (
-            client.table("actual_vs_predicted")
-            .upsert(row, on_conflict="date")
-            .execute()
-            .data
-            or []
-        )
+        inserted = client.table(table_name).insert(row).execute().data or []
     except Exception as exc:
-        logger.exception("Failed to store feedback row: %s", exc)
-        raise HTTPException(status_code=500, detail=f"Failed to store feedback: {exc}") from exc
+        logger.exception("Failed to store guest feedback row: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to store feedback") from exc
 
     return {
-        "status": "feedback_stored",
+        "success": True,
         "feedback": inserted[0] if inserted else row,
-        "is_overridden_prediction": is_overridden,
     }
 
 
@@ -574,6 +634,45 @@ def forecast_today(
         "event_adjustment_applied": result["event_adjustment_applied"],
         "event_note": result["event_note"],
     }
+
+
+@app.get("/events")
+def list_events(
+    start_date: date | None = Query(default=None),
+    end_date: date | None = Query(default=None),
+):
+    client = get_supabase_client()
+    table_name = os.getenv("SUPABASE_EVENTS_TABLE", "events")
+
+    try:
+        query = client.table(table_name).select("*")
+        if start_date is not None:
+            query = query.gte("date", start_date.isoformat())
+        if end_date is not None:
+            query = query.lte("date", end_date.isoformat())
+        rows = query.execute().data or []
+    except Exception as exc:
+        logger.exception("Failed to fetch events: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to fetch events") from exc
+
+    return rows
+
+
+@app.get("/ethiopian_holidays")
+def list_ethiopian_holidays(year: int | None = Query(default=None, ge=1900, le=3000)):
+    client = get_supabase_client()
+    table_name = os.getenv("SUPABASE_HOLIDAYS_TABLE", "ethiopian_holidays")
+
+    try:
+        query = client.table(table_name).select("*")
+        if year is not None:
+            query = query.gte("date", f"{year}-01-01").lte("date", f"{year}-12-31")
+        rows = query.execute().data or []
+    except Exception as exc:
+        logger.exception("Failed to fetch Ethiopian holidays: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to fetch Ethiopian holidays") from exc
+
+    return rows
 
 
 def _get_staff_row(client, staff_id: int) -> dict[str, Any] | None:
@@ -759,6 +858,225 @@ def approve_pricing(payload: PricingApproveRequest):
     return {"success": True}
 
 
+def _resolve_date_range(
+    start_date: date | None,
+    end_date: date | None,
+    default_days: int = 30,
+) -> tuple[date, date]:
+    today = pd.Timestamp.today().date()
+    resolved_end = end_date or today
+    resolved_start = start_date or (resolved_end - timedelta(days=default_days - 1))
+    if resolved_end < resolved_start:
+        raise HTTPException(status_code=422, detail="end_date must be >= start_date")
+    return resolved_start, resolved_end
+
+
+@app.get("/daily_occupancy")
+def list_daily_occupancy(
+    start_date: date | None = Query(default=None),
+    end_date: date | None = Query(default=None),
+):
+    client = get_supabase_client()
+    table_name = os.getenv("SUPABASE_DAILY_OCCUPANCY_TABLE", "daily_occupancy")
+    resolved_start, resolved_end = _resolve_date_range(start_date, end_date)
+
+    try:
+        rows = (
+            client.table(table_name)
+            .select("*")
+            .gte("date", resolved_start.isoformat())
+            .lte("date", resolved_end.isoformat())
+            .execute()
+            .data
+            or []
+        )
+    except Exception as exc:
+        logger.exception("Failed to fetch daily occupancy: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to fetch daily occupancy") from exc
+
+    return rows
+
+
+@app.get("/pricing/approvals")
+def list_pricing_approvals(
+    start_date: date | None = Query(default=None),
+    end_date: date | None = Query(default=None),
+):
+    client = get_supabase_client()
+    resolved_start, resolved_end = _resolve_date_range(start_date, end_date)
+
+    try:
+        rows = (
+            client.table("pricing_approvals")
+            .select("*")
+            .gte("date", resolved_start.isoformat())
+            .lte("date", resolved_end.isoformat())
+            .execute()
+            .data
+            or []
+        )
+    except Exception as exc:
+        logger.exception("Failed to fetch pricing approvals: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to fetch pricing approvals") from exc
+
+    return rows
+
+
+@app.get("/revenue/dashboard")
+def get_revenue_dashboard(
+    start_date: date | None = Query(default=None),
+    end_date: date | None = Query(default=None),
+    total_rooms: int = Query(default=60, ge=1),
+):
+    client = get_supabase_client()
+    resolved_start, resolved_end = _resolve_date_range(start_date, end_date)
+    horizon_days = (resolved_end - resolved_start).days + 1
+    occupancy_table = os.getenv("SUPABASE_DAILY_OCCUPANCY_TABLE", "daily_occupancy")
+
+    try:
+        occupancy_rows = (
+            client.table(occupancy_table)
+            .select("*")
+            .gte("date", resolved_start.isoformat())
+            .lte("date", resolved_end.isoformat())
+            .execute()
+            .data
+            or []
+        )
+    except Exception as exc:
+        logger.exception("Failed to fetch occupancy rows for revenue dashboard: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to build revenue dashboard") from exc
+
+    try:
+        pricing_rows = (
+            client.table("pricing_approvals")
+            .select("*")
+            .gte("date", resolved_start.isoformat())
+            .lte("date", resolved_end.isoformat())
+            .execute()
+            .data
+            or []
+        )
+    except Exception:
+        pricing_rows = []
+
+    forecast_result = forecast(
+        ForecastRequest(
+            horizon_days=horizon_days,
+            include_staffing=True,
+            total_rooms=total_rooms,
+        )
+    )
+
+    occupancy_by_date = {
+        str(row.get("date")): row for row in occupancy_rows if row.get("date") is not None
+    }
+    pricing_by_date: dict[str, float] = {}
+    for row in pricing_rows:
+        day = str(row.get("date") or "")
+        approved_price = row.get("approved_price")
+        if day and approved_price is not None:
+            try:
+                pricing_by_date[day] = float(approved_price)
+            except Exception:
+                continue
+
+    predictions = forecast_result.get("predictions", [])
+
+    daily_data: list[dict[str, Any]] = []
+    total_revenue = 0.0
+    total_rooms_sold = 0.0
+    total_labor_cost = 0.0
+    mape_values: list[float] = []
+    occupancy_values: list[float] = []
+    revpar_values: list[float] = []
+
+    for item in predictions:
+        day = str(item.get("date"))
+        predicted_rooms = float(item.get("predicted_rooms") or 0)
+        predicted_occupancy = float(item.get("occupancy_percentage") or 0)
+        staffing_details = item.get("staffing") or {}
+        labor_cost = float(staffing_details.get("total_labor_cost") or 0)
+
+        occ_row = occupancy_by_date.get(day, {})
+        rooms_sold = occ_row.get("rooms_sold")
+        adr_raw = occ_row.get("adr")
+        adr = 0.0
+        if adr_raw is not None:
+            adr = float(adr_raw)
+        elif day in pricing_by_date:
+            adr = pricing_by_date[day]
+
+        actual_rooms = float(rooms_sold) if rooms_sold is not None else None
+        actual_occupancy = (
+            (actual_rooms / total_rooms) * 100.0 if actual_rooms is not None else None
+        )
+
+        revpar = 0.0
+        if adr > 0:
+            if actual_occupancy is not None:
+                revpar = adr * actual_occupancy / 100.0
+            else:
+                revpar = adr * predicted_occupancy / 100.0
+
+        revenue_rooms = actual_rooms if actual_rooms is not None else predicted_rooms
+        room_revenue = revenue_rooms * adr
+
+        if actual_rooms is not None and actual_rooms > 0:
+            mape_values.append(abs(actual_rooms - predicted_rooms) / actual_rooms * 100.0)
+
+        if actual_occupancy is not None:
+            occupancy_values.append(actual_occupancy)
+        else:
+            occupancy_values.append(predicted_occupancy)
+
+        revpar_values.append(revpar)
+        total_revenue += room_revenue
+        total_labor_cost += labor_cost
+        if actual_rooms is not None:
+            total_rooms_sold += actual_rooms
+
+        daily_data.append(
+            {
+                "date": day,
+                "actual_occupancy": round(actual_occupancy, 2) if actual_occupancy is not None else None,
+                "predicted_occupancy": round(predicted_occupancy, 2),
+                "adr": round(adr, 2),
+                "revpar": round(revpar, 2),
+                "labor_cost": round(labor_cost, 2),
+                "actual_rooms_sold": round(actual_rooms, 2) if actual_rooms is not None else None,
+                "predicted_rooms": round(predicted_rooms, 2),
+                "room_revenue": round(room_revenue, 2),
+            }
+        )
+
+    average_adr = (total_revenue / total_rooms_sold) if total_rooms_sold > 0 else 0.0
+    average_occupancy = (
+        sum(occupancy_values) / len(occupancy_values) if occupancy_values else 0.0
+    )
+    average_revpar = sum(revpar_values) / len(revpar_values) if revpar_values else 0.0
+    labor_cost_percent = (total_labor_cost / total_revenue * 100.0) if total_revenue > 0 else 0.0
+    forecast_accuracy_mape = sum(mape_values) / len(mape_values) if mape_values else 0.0
+    fixed_schedule_cost = total_labor_cost * 1.2
+    estimated_savings = fixed_schedule_cost - total_labor_cost
+
+    summary = {
+        "total_revenue": round(total_revenue, 2),
+        "average_adr": round(average_adr, 2),
+        "average_occupancy": round(average_occupancy, 2),
+        "average_revpar": round(average_revpar, 2),
+        "labor_cost_percent": round(labor_cost_percent, 2),
+        "forecast_accuracy_mape": round(forecast_accuracy_mape, 2),
+        "estimated_savings": round(estimated_savings, 2),
+    }
+
+    return {
+        "metrics": summary,
+        "daily_data": daily_data,
+        "summary": summary,
+    }
+
+
 @app.post("/promotions")
 def create_promotion(payload: PromotionRequest):
     client = get_supabase_client()
@@ -772,8 +1090,50 @@ def create_promotion(payload: PromotionRequest):
     return {"success": True}
 
 
+@app.put("/promotions/{promotion_id}")
+def update_promotion(promotion_id: str, payload: PromotionRequest):
+    client = get_supabase_client()
+    row = payload.dict()
+
+    try:
+        updated = client.table("promotions").update(row).eq("id", promotion_id).execute().data or []
+        if not updated:
+            raise HTTPException(status_code=404, detail="Promotion not found")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Failed to update promotion: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to update promotion") from exc
+
+    return {"success": True}
+
+
+@app.delete("/promotions/{promotion_id}")
+def delete_promotion(promotion_id: str):
+    client = get_supabase_client()
+
+    try:
+        deleted = client.table("promotions").delete().eq("id", promotion_id).execute().data or []
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Promotion not found")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Failed to delete promotion: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to delete promotion") from exc
+
+    return {"success": True}
+
+
 @app.get("/promotions")
 def list_promotions():
+    client = get_supabase_client()
+    rows = client.table("promotions").select("*").execute().data or []
+    return {"promotions": rows}
+
+
+@app.get("/admin/promotions")
+def list_admin_promotions():
     client = get_supabase_client()
     rows = client.table("promotions").select("*").execute().data or []
     return {"promotions": rows}
