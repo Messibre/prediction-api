@@ -486,9 +486,15 @@ def create_admin_extensions_router(
         admin_email: str | None = Query(default=None),
         action_type: str | None = Query(default=None),
         limit: int = Query(default=200, ge=1, le=1000),
+        offset: int = Query(default=0, ge=0),
     ):
         client = get_supabase_client()
-        query = client.table("audit_log").select("*").order("created_at", desc=True).limit(limit)
+        query = (
+            client.table("audit_log")
+            .select("*")
+            .order("created_at", desc=True)
+            .range(offset, offset + limit - 1)
+        )
         if start_date is not None:
             query = query.gte("created_at", start_date.isoformat())
         if end_date is not None:
