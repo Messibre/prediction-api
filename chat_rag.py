@@ -1,0 +1,421 @@
+import json
+import logging
+import os
+from datetime import date, timedelta
+from typing import Any, Callable
+from uuid import uuid4
+
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+
+logger = logging.getLogger(__name__)
+
+CHAT_HISTORY_TABLE = "chat_history"
+MAX_HISTORY_MESSAGES = 20
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _parse_message_payload(raw_text: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(raw_text)
+        if isinstance(payload, dict):
+            return payload
+    except Exception:
+        pass
+
+    return {"message": raw_text}
+
+
+def _extract_question(payload: dict[str, Any]) -> str:
+    message = payload.get("message") or payload.get("content") or payload.get("text")
+    if message is None:
+        return ""
+    return str(message).strip()
+
+
+def _date_window_from_question(question_lower: str) -> tuple[date, date]:
+    today = date.today()
+
+    if "today" in question_lower:
+        return today, today
+    if "tomorrow" in question_lower:
+        tomorrow = today + timedelta(days=1)
+        return tomorrow, tomorrow
+    if "yesterday" in question_lower:
+        yesterday = today - timedelta(days=1)
+        return yesterday, yesterday
+    if "last week" in question_lower:
+        return today - timedelta(days=7), today
+    if "next week" in question_lower:
+        return today, today + timedelta(days=7)
+
+    return today - timedelta(days=30), today
+
+
+def _contains_any(question_lower: str, keywords: list[str]) -> bool:
+    return any(keyword in question_lower for keyword in keywords)
+
+
+def _rows_to_bullet_text(title: str, rows: list[dict[str, Any]], limit: int = 12) -> str:
+    if not rows:
+        return f"{title}: none found."
+
+    lines = [f"{title}:"]
+    for row in rows[:limit]:
+        parts = []
+        for key, value in row.items():
+            parts.append(f"{key}={value}")
+        lines.append(f"- {', '.join(parts)}")
+
+    if len(rows) > limit:
+        lines.append(f"- ... and {len(rows) - limit} more rows")
+
+    return "\n".join(lines)
+
+
+def _read_chat_history(client: Any, session_id: str, limit: int = MAX_HISTORY_MESSAGES) -> list[dict[str, str]]:
+    try:
+        rows = (
+            client.table(CHAT_HISTORY_TABLE)
+            .select("role,content,created_at")
+            .eq("session_id", session_id)
+            .order("created_at", desc=False)
+            .limit(limit)
+            .execute()
+            .data
+            or []
+        )
+    except Exception as exc:
+        logger.warning("Failed to load chat history for %s: %s", session_id, exc)
+        return []
+
+    normalized: list[dict[str, str]] = []
+    for row in rows:
+        role = str(row.get("role") or "assistant")
+        content = str(row.get("content") or "")
+        if role not in {"user", "assistant"}:
+            continue
+        if not content:
+            continue
+        normalized.append({"role": role, "content": content})
+
+    return normalized[-limit:]
+
+
+def _save_chat_message(client: Any, session_id: str, role: str, content: str) -> None:
+    try:
+        client.table(CHAT_HISTORY_TABLE).insert(
+            {
+                "session_id": session_id,
+                "role": role,
+                "content": content,
+            }
+        ).execute()
+    except Exception as exc:
+        logger.warning("Failed to store chat message: %s", exc)
+
+
+def search_relevant_data(question: str, client: Any) -> tuple[str, list[str]]:
+    question_lower = question.lower()
+    start_dt, end_dt = _date_window_from_question(question_lower)
+
+    chunks: list[str] = []
+    source_tables: set[str] = set()
+
+    try:
+        if _contains_any(
+            question_lower,
+            ["occupancy", "rooms sold", "how busy", "forecast"],
+        ):
+            occupancy_rows = (
+                client.table("daily_occupancy")
+                .select("date,rooms_sold,adr")
+                .gte("date", start_dt.isoformat())
+                .lte("date", end_dt.isoformat())
+                .order("date", desc=False)
+                .execute()
+                .data
+                or []
+            )
+            chunks.append(_rows_to_bullet_text("Occupancy data", occupancy_rows))
+            source_tables.add("daily_occupancy")
+
+            override_rows = (
+                client.table("forecast_overrides")
+                .select("date,new_prediction,reason,created_by")
+                .gte("date", start_dt.isoformat())
+                .lte("date", end_dt.isoformat())
+                .order("date", desc=False)
+                .execute()
+                .data
+                or []
+            )
+            if override_rows:
+                chunks.append(_rows_to_bullet_text("Forecast overrides", override_rows))
+                source_tables.add("forecast_overrides")
+    except Exception as exc:
+        chunks.append(f"Occupancy lookup failed: {exc}")
+
+    try:
+        if _contains_any(
+            question_lower,
+            ["staff", "employee", "housekeeping", "front desk", "maintenance", "who works"],
+        ):
+            staff_rows = (
+                client.table("staff")
+                .select("name,email,department,is_active")
+                .eq("is_active", True)
+                .order("department", desc=False)
+                .execute()
+                .data
+                or []
+            )
+            chunks.append(_rows_to_bullet_text("Staff roster", staff_rows))
+            source_tables.add("staff")
+    except Exception as exc:
+        chunks.append(f"Staff lookup failed: {exc}")
+
+    try:
+        if _contains_any(question_lower, ["schedule", "shift", "working", "tomorrow", "today"]):
+            schedule_rows = (
+                client.table("staff_schedule")
+                .select("date,shift_start,shift_end,department,staff_id")
+                .gte("date", start_dt.isoformat())
+                .lte("date", end_dt.isoformat())
+                .order("date", desc=False)
+                .execute()
+                .data
+                or []
+            )
+            chunks.append(_rows_to_bullet_text("Schedule entries", schedule_rows))
+            source_tables.add("staff_schedule")
+    except Exception as exc:
+        chunks.append(f"Schedule lookup failed: {exc}")
+
+    try:
+        if _contains_any(question_lower, ["feedback", "review", "comment", "complaint", "rating"]):
+            query = (
+                client.table("feedback")
+                .select("date,guest_name,rating,comment,sentiment")
+                .gte("date", start_dt.isoformat())
+                .lte("date", end_dt.isoformat())
+            )
+            if _contains_any(question_lower, ["negative", "complaint", "bad"]):
+                query = query.eq("sentiment", "negative")
+
+            feedback_rows = query.order("date", desc=False).execute().data or []
+            chunks.append(_rows_to_bullet_text("Guest feedback", feedback_rows))
+            source_tables.add("feedback")
+    except Exception as exc:
+        chunks.append(f"Feedback lookup failed: {exc}")
+
+    try:
+        if _contains_any(question_lower, ["promotion", "package", "offer", "discount", "deal"]):
+            promo_rows = (
+                client.table("promotions")
+                .select("title,start_date,end_date,discount_percent,is_active")
+                .eq("is_active", True)
+                .order("start_date", desc=False)
+                .execute()
+                .data
+                or []
+            )
+            chunks.append(_rows_to_bullet_text("Active promotions", promo_rows))
+            source_tables.add("promotions")
+    except Exception as exc:
+        chunks.append(f"Promotion lookup failed: {exc}")
+
+    try:
+        if _contains_any(question_lower, ["price", "rate", "cost", "revenue", "adr"]):
+            pricing_rows = (
+                client.table("pricing_approvals")
+                .select("date,room_type,approved_price")
+                .gte("date", start_dt.isoformat())
+                .lte("date", end_dt.isoformat())
+                .order("date", desc=False)
+                .execute()
+                .data
+                or []
+            )
+            chunks.append(_rows_to_bullet_text("Approved pricing", pricing_rows))
+            source_tables.add("pricing_approvals")
+    except Exception as exc:
+        chunks.append(f"Pricing lookup failed: {exc}")
+
+    try:
+        if _contains_any(question_lower, ["override", "adjustment", "manual change"]):
+            override_rows = (
+                client.table("forecast_overrides")
+                .select("date,new_prediction,reason,created_by,created_at")
+                .gte("date", start_dt.isoformat())
+                .lte("date", end_dt.isoformat())
+                .order("created_at", desc=True)
+                .execute()
+                .data
+                or []
+            )
+            chunks.append(_rows_to_bullet_text("Manual overrides", override_rows))
+            source_tables.add("forecast_overrides")
+    except Exception as exc:
+        chunks.append(f"Override lookup failed: {exc}")
+
+    if not chunks:
+        return "No specific data found for this query in the database.", []
+
+    return "\n\n".join(chunks), sorted(source_tables)
+
+
+def _build_gemini_prompt(
+    question: str,
+    context: str,
+    history: list[dict[str, str]],
+) -> str:
+    history_text = "\n".join(
+        [f"{item['role']}: {item['content']}" for item in history[-MAX_HISTORY_MESSAGES:]]
+    )
+
+    return (
+        "You are Ethio-Habesha Resort AI assistant.\n"
+        "Use ONLY the provided context and conversation history to answer.\n"
+        "If data is not available, clearly say you do not have that information.\n"
+        "Be concise, professional, and helpful.\n\n"
+        f"Context from database:\n{context}\n\n"
+        f"Conversation history:\n{history_text}\n\n"
+        f"User question: {question}\n"
+    )
+
+
+def _call_gemini(question: str, context: str, history: list[dict[str, str]]) -> str:
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        return (
+            "GEMINI_API_KEY is not configured. "
+            "Chat response fallback: I can only return retrieved data right now.\n\n"
+            f"{context}"
+        )
+
+    prompt = _build_gemini_prompt(question, context, history)
+
+    try:
+        from google import genai
+    except Exception:
+        return (
+            "Gemini SDK is not available in this environment. "
+            "Install google-genai and redeploy.\n\n"
+            f"Retrieved context:\n{context}"
+        )
+
+    try:
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt,
+            config={"temperature": 0.7},
+        )
+
+        text = getattr(response, "text", None)
+        if text and str(text).strip():
+            return str(text).strip()
+
+        # Defensive parsing for possible SDK response shapes.
+        candidates = getattr(response, "candidates", None) or []
+        for candidate in candidates:
+            content = getattr(candidate, "content", None)
+            parts = getattr(content, "parts", None) or []
+            for part in parts:
+                part_text = getattr(part, "text", None)
+                if part_text:
+                    return str(part_text).strip()
+
+        return "I could not generate a response from Gemini for this request."
+    except Exception as exc:
+        logger.exception("Gemini request failed: %s", exc)
+        return (
+            "I could not reach Gemini right now. "
+            "Here is the retrieved data from your database:\n\n"
+            f"{context}"
+        )
+
+
+def create_chat_router(get_supabase_client: Callable[[], Any]) -> APIRouter:
+    router = APIRouter()
+    active_connections: dict[str, WebSocket] = {}
+
+    @router.websocket("/ws/chat")
+    async def chat_socket(websocket: WebSocket) -> None:
+        await websocket.accept()
+
+        query_session_id = websocket.query_params.get("session_id")
+        session_id = query_session_id or str(uuid4())
+        active_connections[session_id] = websocket
+
+        try:
+            client = get_supabase_client()
+            history = _read_chat_history(client, session_id)
+
+            await websocket.send_json(
+                {
+                    "session_id": session_id,
+                    "role": "assistant",
+                    "content": "Connected to Ethio-Habesha AI assistant.",
+                }
+            )
+
+            while True:
+                raw_text = await websocket.receive_text()
+                payload = _parse_message_payload(raw_text)
+                question = _extract_question(payload)
+
+                if not question:
+                    await websocket.send_json(
+                        {
+                            "session_id": session_id,
+                            "role": "assistant",
+                            "content": "Please send a non-empty message.",
+                        }
+                    )
+                    continue
+
+                _save_chat_message(client, session_id, "user", question)
+                history.append({"role": "user", "content": question})
+
+                context, source_tables = search_relevant_data(question, client)
+                answer = _call_gemini(question, context, history)
+
+                _save_chat_message(client, session_id, "assistant", answer)
+                history.append({"role": "assistant", "content": answer})
+                history = history[-MAX_HISTORY_MESSAGES:]
+
+                await websocket.send_json(
+                    {
+                        "session_id": session_id,
+                        "role": "assistant",
+                        "content": answer,
+                        "grounded": len(source_tables) > 0,
+                        "source_tables": source_tables,
+                    }
+                )
+
+        except WebSocketDisconnect:
+            logger.info("WebSocket disconnected for session_id=%s", session_id)
+        except Exception as exc:
+            logger.exception("WebSocket chat failed for session_id=%s: %s", session_id, exc)
+            try:
+                await websocket.send_json(
+                    {
+                        "session_id": session_id,
+                        "role": "assistant",
+                        "content": "Internal server error while processing chat.",
+                    }
+                )
+            except Exception:
+                pass
+        finally:
+            active_connections.pop(session_id, None)
+
+    return router

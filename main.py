@@ -10,6 +10,8 @@ from fastapi import FastAPI, Header, HTTPException, Query
 from huggingface_hub import hf_hub_download
 from pydantic import BaseModel, Field
 
+from chat_rag import create_chat_router
+
 app = FastAPI()
 
 logger = logging.getLogger(__name__)
@@ -196,6 +198,9 @@ def get_supabase_client():
     except Exception as exc:
         logger.exception("Failed to initialize Supabase client: %s", exc)
         raise HTTPException(status_code=503, detail="Supabase client unavailable") from exc
+
+
+app.include_router(create_chat_router(get_supabase_client))
 
 
 def ensure_default_staffing_rules(client) -> None:
