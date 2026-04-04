@@ -11,6 +11,14 @@ logger = logging.getLogger(__name__)
 
 CHAT_HISTORY_TABLE = "chat_history"
 MAX_HISTORY_MESSAGES = 20
+DEFAULT_FALLBACK_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-1.5-flash",
+    "gemma-3-27b-it",
+    "gemma-3-12b-it",
+    "gemma-3-4b-it",
+    "gemma-3-1b-it",
+]
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -413,29 +421,53 @@ def _call_gemini(question: str, context: str, history: list[dict[str, str]]) -> 
             f"Retrieved context:\n{context}"
         )
 
+    model_chain_env = os.getenv("GEMINI_MODEL_CHAIN", "")
+    model_chain = [
+        model.strip()
+        for model in (model_chain_env.split(",") if model_chain_env else DEFAULT_FALLBACK_MODELS)
+        if model.strip()
+    ]
+
+    if not model_chain:
+        model_chain = DEFAULT_FALLBACK_MODELS
+
     try:
         client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model="gemini-1.5-flash",
-            contents=prompt,
-            config={"temperature": 0.7},
+        model_errors: list[str] = []
+
+        for model_name in model_chain:
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config={"temperature": 0.7},
+                )
+
+                text = getattr(response, "text", None)
+                if text and str(text).strip():
+                    return str(text).strip()
+
+                # Defensive parsing for possible SDK response shapes.
+                candidates = getattr(response, "candidates", None) or []
+                for candidate in candidates:
+                    content = getattr(candidate, "content", None)
+                    parts = getattr(content, "parts", None) or []
+                    for part in parts:
+                        part_text = getattr(part, "text", None)
+                        if part_text:
+                            return str(part_text).strip()
+
+                model_errors.append(f"{model_name}: empty response")
+            except Exception as model_exc:
+                model_errors.append(f"{model_name}: {model_exc}")
+                continue
+
+        logger.error("All Gemini models failed: %s", " | ".join(model_errors))
+        return (
+            "I could not reach an available Gemini model right now. "
+            "Here is the retrieved data from your database:\n\n"
+            f"{context}"
         )
-
-        text = getattr(response, "text", None)
-        if text and str(text).strip():
-            return str(text).strip()
-
-        # Defensive parsing for possible SDK response shapes.
-        candidates = getattr(response, "candidates", None) or []
-        for candidate in candidates:
-            content = getattr(candidate, "content", None)
-            parts = getattr(content, "parts", None) or []
-            for part in parts:
-                part_text = getattr(part, "text", None)
-                if part_text:
-                    return str(part_text).strip()
-
-        return "I could not generate a response from Gemini for this request."
     except Exception as exc:
         logger.exception("Gemini request failed: %s", exc)
         return (
