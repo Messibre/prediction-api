@@ -21,6 +21,61 @@ DEFAULT_FALLBACK_MODELS = [
 ]
 
 
+def _forecast_horizon_from_question(question_lower: str) -> int:
+    if "today" in question_lower or "tomorrow" in question_lower:
+        return 3
+    if "next week" in question_lower:
+        return 7
+    if "next month" in question_lower:
+        return 30
+    return 14
+
+
+def _build_live_forecast_context(
+    question: str,
+    forecast_provider: Callable[[int, int], dict[str, Any]] | None,
+    total_rooms: int,
+) -> tuple[str, list[str]]:
+    if forecast_provider is None:
+        return ("", [])
+
+    question_lower = question.lower()
+    horizon_days = _forecast_horizon_from_question(question_lower)
+
+    try:
+        forecast_payload = forecast_provider(horizon_days, total_rooms)
+    except Exception as exc:
+        logger.warning("Live forecast generation failed: %s", exc)
+        return (f"Live forecast generation failed: {exc}", ["forecast"])
+
+    predictions = forecast_payload.get("predictions") if isinstance(forecast_payload, dict) else None
+    if not isinstance(predictions, list) or not predictions:
+        return ("Live forecast is available but returned no prediction rows.", ["forecast"])
+
+    preview_rows: list[dict[str, Any]] = []
+    for row in predictions[: min(len(predictions), 10)]:
+        if not isinstance(row, dict):
+            continue
+        preview_rows.append(
+            {
+                "date": row.get("date"),
+                "predicted_rooms": row.get("predicted_rooms"),
+                "occupancy_percentage": row.get("occupancy_percentage"),
+                "demand_class": row.get("demand_class"),
+                "is_overridden": row.get("is_overridden"),
+            }
+        )
+
+    if not preview_rows:
+        return ("Live forecast returned rows but they could not be parsed.", ["forecast"])
+
+    summary = (
+        f"Live forecast context (horizon_days={horizon_days}, total_rooms={total_rooms}, "
+        f"rows={len(predictions)}):\n"
+    )
+    return (summary + _rows_to_bullet_text("Forecast predictions", preview_rows), ["forecast"])
+
+
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
         return float(value)
@@ -560,7 +615,10 @@ def _call_gemini(question: str, context: str, history: list[dict[str, str]]) -> 
         )
 
 
-def create_chat_router(get_supabase_client: Callable[[], Any]) -> APIRouter:
+def create_chat_router(
+    get_supabase_client: Callable[[], Any],
+    forecast_provider: Callable[[int, int], dict[str, Any]] | None = None,
+) -> APIRouter:
     router = APIRouter()
     active_connections: dict[str, WebSocket] = {}
 
@@ -603,6 +661,16 @@ def create_chat_router(get_supabase_client: Callable[[], Any]) -> APIRouter:
                 history.append({"role": "user", "content": question})
 
                 context, source_tables = search_relevant_data(question, client)
+                live_forecast_context, live_sources = _build_live_forecast_context(
+                    question,
+                    forecast_provider,
+                    total_rooms=60,
+                )
+                if live_forecast_context:
+                    context = f"{context}\n\n{live_forecast_context}"
+                if live_sources:
+                    source_tables = sorted(set(source_tables).union(live_sources))
+
                 answer = _call_gemini(question, context, history)
 
                 _save_chat_message(client, session_id, "assistant", answer)

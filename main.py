@@ -201,7 +201,18 @@ def get_supabase_client():
         raise HTTPException(status_code=503, detail="Supabase client unavailable") from exc
 
 
-app.include_router(create_chat_router(get_supabase_client))
+app.include_router(
+    create_chat_router(
+        get_supabase_client,
+        forecast_provider=lambda horizon_days, total_rooms: forecast(
+            ForecastRequest(
+                horizon_days=horizon_days,
+                include_staffing=True,
+                total_rooms=total_rooms,
+            )
+        ),
+    )
+)
 app.include_router(create_admin_extensions_router(get_supabase_client, lambda: MODEL is not None))
 
 
