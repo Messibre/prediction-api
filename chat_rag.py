@@ -78,6 +78,34 @@ def _rows_to_bullet_text(title: str, rows: list[dict[str, Any]], limit: int = 12
     return "\n".join(lines)
 
 
+def _fetch_rows(
+    client: Any,
+    table_name: str,
+    select_clause: str,
+    filters: list[tuple[str, str, Any]] | None = None,
+    order_by: str | None = None,
+    desc: bool = False,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    query = client.table(table_name).select(select_clause)
+
+    for operator, column, value in filters or []:
+        if operator == "eq":
+            query = query.eq(column, value)
+        elif operator == "gte":
+            query = query.gte(column, value)
+        elif operator == "lte":
+            query = query.lte(column, value)
+
+    if order_by is not None:
+        query = query.order(order_by, desc=desc)
+
+    if limit is not None:
+        query = query.limit(limit)
+
+    return query.execute().data or []
+
+
 def _read_chat_history(client: Any, session_id: str, limit: int = MAX_HISTORY_MESSAGES) -> list[dict[str, str]]:
     try:
         rows = (
@@ -132,28 +160,38 @@ def search_relevant_data(question: str, client: Any) -> tuple[str, list[str]]:
             question_lower,
             ["occupancy", "rooms sold", "how busy", "forecast"],
         ):
-            occupancy_rows = (
-                client.table("daily_occupancy")
-                .select("date,rooms_sold,adr")
-                .gte("date", start_dt.isoformat())
-                .lte("date", end_dt.isoformat())
-                .order("date", desc=False)
-                .execute()
-                .data
-                or []
+            occupancy_rows = _fetch_rows(
+                client,
+                "daily_occupancy",
+                "date,rooms_sold,adr",
+                filters=[("gte", "date", start_dt.isoformat()), ("lte", "date", end_dt.isoformat())],
+                order_by="date",
+                desc=False,
             )
-            chunks.append(_rows_to_bullet_text("Occupancy data", occupancy_rows))
+            if occupancy_rows:
+                chunks.append(_rows_to_bullet_text("Occupancy data", occupancy_rows))
+            else:
+                latest_occupancy_rows = _fetch_rows(
+                    client,
+                    "daily_occupancy",
+                    "date,rooms_sold,adr",
+                    order_by="date",
+                    desc=True,
+                    limit=7,
+                )
+                chunks.append(
+                    "Requested date window had no occupancy rows. Latest available occupancy data:\n"
+                    + _rows_to_bullet_text("Occupancy data", latest_occupancy_rows)
+                )
             source_tables.add("daily_occupancy")
 
-            override_rows = (
-                client.table("forecast_overrides")
-                .select("date,new_prediction,reason,created_by")
-                .gte("date", start_dt.isoformat())
-                .lte("date", end_dt.isoformat())
-                .order("date", desc=False)
-                .execute()
-                .data
-                or []
+            override_rows = _fetch_rows(
+                client,
+                "forecast_overrides",
+                "date,new_prediction,reason,created_by",
+                filters=[("gte", "date", start_dt.isoformat()), ("lte", "date", end_dt.isoformat())],
+                order_by="date",
+                desc=False,
             )
             if override_rows:
                 chunks.append(_rows_to_bullet_text("Forecast overrides", override_rows))
@@ -166,14 +204,13 @@ def search_relevant_data(question: str, client: Any) -> tuple[str, list[str]]:
             question_lower,
             ["staff", "employee", "housekeeping", "front desk", "maintenance", "who works"],
         ):
-            staff_rows = (
-                client.table("staff")
-                .select("name,email,department,is_active")
-                .eq("is_active", True)
-                .order("department", desc=False)
-                .execute()
-                .data
-                or []
+            staff_rows = _fetch_rows(
+                client,
+                "staff",
+                "name,email,department,is_active",
+                filters=[("eq", "is_active", True)],
+                order_by="department",
+                desc=False,
             )
             chunks.append(_rows_to_bullet_text("Staff roster", staff_rows))
             source_tables.add("staff")
@@ -182,84 +219,149 @@ def search_relevant_data(question: str, client: Any) -> tuple[str, list[str]]:
 
     try:
         if _contains_any(question_lower, ["schedule", "shift", "working", "tomorrow", "today"]):
-            schedule_rows = (
-                client.table("staff_schedule")
-                .select("date,shift_start,shift_end,department,staff_id")
-                .gte("date", start_dt.isoformat())
-                .lte("date", end_dt.isoformat())
-                .order("date", desc=False)
-                .execute()
-                .data
-                or []
+            schedule_rows = _fetch_rows(
+                client,
+                "staff_schedule",
+                "date,shift_start,shift_end,department,staff_id",
+                filters=[("gte", "date", start_dt.isoformat()), ("lte", "date", end_dt.isoformat())],
+                order_by="date",
+                desc=False,
             )
-            chunks.append(_rows_to_bullet_text("Schedule entries", schedule_rows))
+            if schedule_rows:
+                chunks.append(_rows_to_bullet_text("Schedule entries", schedule_rows))
+            else:
+                latest_schedule_rows = _fetch_rows(
+                    client,
+                    "staff_schedule",
+                    "date,shift_start,shift_end,department,staff_id",
+                    order_by="date",
+                    desc=True,
+                    limit=14,
+                )
+                chunks.append(
+                    "Requested date window had no schedule rows. Latest available schedule entries:\n"
+                    + _rows_to_bullet_text("Schedule entries", latest_schedule_rows)
+                )
             source_tables.add("staff_schedule")
     except Exception as exc:
         chunks.append(f"Schedule lookup failed: {exc}")
 
     try:
         if _contains_any(question_lower, ["feedback", "review", "comment", "complaint", "rating"]):
-            query = (
-                client.table("feedback")
-                .select("date,guest_name,rating,comment,sentiment")
-                .gte("date", start_dt.isoformat())
-                .lte("date", end_dt.isoformat())
+            query = _fetch_rows(
+                client,
+                "feedback",
+                "date,guest_name,rating,comment,sentiment",
+                filters=[("gte", "date", start_dt.isoformat()), ("lte", "date", end_dt.isoformat())],
+                order_by="date",
+                desc=False,
             )
             if _contains_any(question_lower, ["negative", "complaint", "bad"]):
-                query = query.eq("sentiment", "negative")
+                query = [row for row in query if str(row.get("sentiment") or "").lower() == "negative"]
 
-            feedback_rows = query.order("date", desc=False).execute().data or []
-            chunks.append(_rows_to_bullet_text("Guest feedback", feedback_rows))
+            feedback_rows = query
+            if feedback_rows:
+                chunks.append(_rows_to_bullet_text("Guest feedback", feedback_rows))
+            else:
+                latest_feedback_rows = _fetch_rows(
+                    client,
+                    "feedback",
+                    "date,guest_name,rating,comment,sentiment",
+                    order_by="date",
+                    desc=True,
+                    limit=10,
+                )
+                chunks.append(
+                    "Requested date window had no feedback rows. Latest available feedback:\n"
+                    + _rows_to_bullet_text("Guest feedback", latest_feedback_rows)
+                )
             source_tables.add("feedback")
     except Exception as exc:
         chunks.append(f"Feedback lookup failed: {exc}")
 
     try:
         if _contains_any(question_lower, ["promotion", "package", "offer", "discount", "deal"]):
-            promo_rows = (
-                client.table("promotions")
-                .select("title,start_date,end_date,discount_percent,is_active")
-                .eq("is_active", True)
-                .order("start_date", desc=False)
-                .execute()
-                .data
-                or []
+            promo_rows = _fetch_rows(
+                client,
+                "promotions",
+                "title,start_date,end_date,discount_percent,is_active",
+                filters=[("eq", "is_active", True)],
+                order_by="start_date",
+                desc=False,
             )
-            chunks.append(_rows_to_bullet_text("Active promotions", promo_rows))
+            if promo_rows:
+                chunks.append(_rows_to_bullet_text("Active promotions", promo_rows))
+            else:
+                recent_promos = _fetch_rows(
+                    client,
+                    "promotions",
+                    "title,start_date,end_date,discount_percent,is_active",
+                    order_by="start_date",
+                    desc=True,
+                    limit=10,
+                )
+                chunks.append(
+                    "No active promotions found. Most recent promotions:\n"
+                    + _rows_to_bullet_text("Promotions", recent_promos)
+                )
             source_tables.add("promotions")
     except Exception as exc:
         chunks.append(f"Promotion lookup failed: {exc}")
 
     try:
         if _contains_any(question_lower, ["price", "rate", "cost", "revenue", "adr"]):
-            pricing_rows = (
-                client.table("pricing_approvals")
-                .select("date,room_type,approved_price")
-                .gte("date", start_dt.isoformat())
-                .lte("date", end_dt.isoformat())
-                .order("date", desc=False)
-                .execute()
-                .data
-                or []
+            pricing_rows = _fetch_rows(
+                client,
+                "pricing_approvals",
+                "date,room_type,approved_price",
+                filters=[("gte", "date", start_dt.isoformat()), ("lte", "date", end_dt.isoformat())],
+                order_by="date",
+                desc=False,
             )
-            chunks.append(_rows_to_bullet_text("Approved pricing", pricing_rows))
+            if pricing_rows:
+                chunks.append(_rows_to_bullet_text("Approved pricing", pricing_rows))
+            else:
+                recent_pricing_rows = _fetch_rows(
+                    client,
+                    "pricing_approvals",
+                    "date,room_type,approved_price",
+                    order_by="date",
+                    desc=True,
+                    limit=10,
+                )
+                chunks.append(
+                    "No pricing approvals found in the requested window. Most recent approvals:\n"
+                    + _rows_to_bullet_text("Approved pricing", recent_pricing_rows)
+                )
             source_tables.add("pricing_approvals")
     except Exception as exc:
         chunks.append(f"Pricing lookup failed: {exc}")
 
     try:
         if _contains_any(question_lower, ["override", "adjustment", "manual change"]):
-            override_rows = (
-                client.table("forecast_overrides")
-                .select("date,new_prediction,reason,created_by,created_at")
-                .gte("date", start_dt.isoformat())
-                .lte("date", end_dt.isoformat())
-                .order("created_at", desc=True)
-                .execute()
-                .data
-                or []
+            override_rows = _fetch_rows(
+                client,
+                "forecast_overrides",
+                "date,new_prediction,reason,created_by,created_at",
+                filters=[("gte", "date", start_dt.isoformat()), ("lte", "date", end_dt.isoformat())],
+                order_by="created_at",
+                desc=True,
             )
-            chunks.append(_rows_to_bullet_text("Manual overrides", override_rows))
+            if override_rows:
+                chunks.append(_rows_to_bullet_text("Manual overrides", override_rows))
+            else:
+                recent_override_rows = _fetch_rows(
+                    client,
+                    "forecast_overrides",
+                    "date,new_prediction,reason,created_by,created_at",
+                    order_by="created_at",
+                    desc=True,
+                    limit=10,
+                )
+                chunks.append(
+                    "No overrides found in the requested window. Most recent overrides:\n"
+                    + _rows_to_bullet_text("Manual overrides", recent_override_rows)
+                )
             source_tables.add("forecast_overrides")
     except Exception as exc:
         chunks.append(f"Override lookup failed: {exc}")
@@ -282,7 +384,8 @@ def _build_gemini_prompt(
     return (
         "You are Ethio-Habesha Resort AI assistant.\n"
         "Use ONLY the provided context and conversation history to answer.\n"
-        "If data is not available, clearly say you do not have that information.\n"
+        "If the exact date range has no rows, use the latest available records and say so explicitly.\n"
+        "If data is still not available, clearly say you do not have that information.\n"
         "Be concise, professional, and helpful.\n\n"
         f"Context from database:\n{context}\n\n"
         f"Conversation history:\n{history_text}\n\n"
