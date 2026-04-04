@@ -350,20 +350,31 @@ def fetch_future_events(start_dt: date, end_dt: date) -> dict[str, Any]:
 
     try:
         client = create_client(url, key)
-        response = (
-            client.table(table_name)
-            .select("date,name")
-            .gte("date", start_dt.isoformat())
-            .lte("date", end_dt.isoformat())
-            .execute()
-        )
+        try:
+            # Current schema uses event_name; keep a fallback for older name-based schemas.
+            response = (
+                client.table(table_name)
+                .select("date,event_name")
+                .gte("date", start_dt.isoformat())
+                .lte("date", end_dt.isoformat())
+                .execute()
+            )
+        except Exception:
+            response = (
+                client.table(table_name)
+                .select("date,name")
+                .gte("date", start_dt.isoformat())
+                .lte("date", end_dt.isoformat())
+                .execute()
+            )
         rows = response.data or []
         events_by_date: dict[str, list[str]] = {}
         for row in rows:
             day = str(row.get("date"))
             if not day:
                 continue
-            events_by_date.setdefault(day, []).append(row.get("name") or "event")
+            event_label = row.get("event_name") or row.get("name") or "event"
+            events_by_date.setdefault(day, []).append(str(event_label))
         return {"events_by_date": events_by_date, "note": None}
     except Exception as exc:
         logger.exception("Failed to fetch events from Supabase: %s", exc)
