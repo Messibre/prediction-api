@@ -86,6 +86,83 @@ def _rows_to_bullet_text(title: str, rows: list[dict[str, Any]], limit: int = 12
     return "\n".join(lines)
 
 
+def _build_general_snapshot(client: Any) -> tuple[str, list[str]]:
+    chunks: list[str] = []
+    source_tables: list[str] = []
+
+    try:
+        occupancy_rows = _fetch_rows(
+            client,
+            "daily_occupancy",
+            "date,rooms_sold,adr",
+            order_by="date",
+            desc=True,
+            limit=7,
+        )
+        chunks.append(_rows_to_bullet_text("Latest occupancy", occupancy_rows))
+        source_tables.append("daily_occupancy")
+    except Exception as exc:
+        chunks.append(f"Latest occupancy lookup failed: {exc}")
+
+    try:
+        schedule_rows = _fetch_rows(
+            client,
+            "staff_schedule",
+            "date,shift_start,shift_end,department,staff_id",
+            order_by="date",
+            desc=True,
+            limit=10,
+        )
+        chunks.append(_rows_to_bullet_text("Latest schedule entries", schedule_rows))
+        source_tables.append("staff_schedule")
+    except Exception as exc:
+        chunks.append(f"Latest schedule lookup failed: {exc}")
+
+    try:
+        promo_rows = _fetch_rows(
+            client,
+            "promotions",
+            "title,start_date,end_date,discount_percent,is_active",
+            order_by="start_date",
+            desc=True,
+            limit=5,
+        )
+        chunks.append(_rows_to_bullet_text("Recent promotions", promo_rows))
+        source_tables.append("promotions")
+    except Exception as exc:
+        chunks.append(f"Recent promotions lookup failed: {exc}")
+
+    try:
+        pricing_rows = _fetch_rows(
+            client,
+            "pricing_approvals",
+            "date,room_type,approved_price",
+            order_by="date",
+            desc=True,
+            limit=7,
+        )
+        chunks.append(_rows_to_bullet_text("Recent approved pricing", pricing_rows))
+        source_tables.append("pricing_approvals")
+    except Exception as exc:
+        chunks.append(f"Recent pricing lookup failed: {exc}")
+
+    try:
+        feedback_rows = _fetch_rows(
+            client,
+            "feedback",
+            "date,guest_name,rating,comment,sentiment",
+            order_by="date",
+            desc=True,
+            limit=7,
+        )
+        chunks.append(_rows_to_bullet_text("Latest guest feedback", feedback_rows))
+        source_tables.append("feedback")
+    except Exception as exc:
+        chunks.append(f"Latest feedback lookup failed: {exc}")
+
+    return "\n\n".join(chunks), sorted(set(source_tables))
+
+
 def _fetch_rows(
     client: Any,
     table_name: str,
@@ -375,7 +452,13 @@ def search_relevant_data(question: str, client: Any) -> tuple[str, list[str]]:
         chunks.append(f"Override lookup failed: {exc}")
 
     if not chunks:
-        return "No specific data found for this query in the database.", []
+        snapshot_text, snapshot_sources = _build_general_snapshot(client)
+        return (
+            "No direct keyword match for this question. "
+            "Using latest operational snapshot from the database:\n\n"
+            f"{snapshot_text}",
+            snapshot_sources,
+        )
 
     return "\n\n".join(chunks), sorted(source_tables)
 
