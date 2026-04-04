@@ -1,10 +1,11 @@
+import importlib
 import logging
 import os
+import pickle
 from datetime import date
 from math import ceil
 from typing import Any
 
-import joblib
 import pandas as pd
 from fastapi import FastAPI, Header, HTTPException, Query
 from huggingface_hub import hf_hub_download
@@ -137,6 +138,18 @@ class PromotionRequest(BaseModel):
     is_active: bool = True
 
 
+def _promotion_payload_to_row(payload: PromotionRequest) -> dict[str, Any]:
+    return {
+        "title": payload.title,
+        "description": payload.description or "",
+        "start_date": payload.start_date.isoformat(),
+        "end_date": payload.end_date.isoformat(),
+        "discount_percent": float(payload.discount_percent),
+        "room_types": payload.room_types or [],
+        "is_active": bool(payload.is_active),
+    }
+
+
 def load_model_from_huggingface() -> None:
     global MODEL, MODEL_LOAD_ERROR
 
@@ -155,7 +168,14 @@ def load_model_from_huggingface() -> None:
             filename=model_filename,
             token=hf_token,
         )
-        MODEL = joblib.load(model_path)
+
+        try:
+            joblib_module = importlib.import_module("joblib")
+            MODEL = joblib_module.load(model_path)
+        except ModuleNotFoundError:
+            with open(model_path, "rb") as f:
+                MODEL = pickle.load(f)
+
         MODEL_LOAD_ERROR = None
         logger.info("Model loaded successfully from Hugging Face")
     except Exception as exc:
@@ -762,13 +782,54 @@ def approve_pricing(payload: PricingApproveRequest):
 @app.post("/promotions")
 def create_promotion(payload: PromotionRequest):
     client = get_supabase_client()
-    row = payload.dict()
+    row = _promotion_payload_to_row(payload)
     row["created_at"] = pd.Timestamp.now().isoformat()
     try:
-        client.table("promotions").insert(row).execute()
+        inserted = client.table("promotions").insert(row).execute().data or []
     except Exception as exc:
         logger.exception("Failed to create promotion: %s", exc)
-        raise HTTPException(status_code=500, detail="Failed to create promotion") from exc
+        raise HTTPException(status_code=500, detail=f"Failed to create promotion: {exc}") from exc
+    return {"success": True, "promotion": inserted[0] if inserted else row}
+
+
+@app.put("/promotions/{promotion_id}")
+def update_promotion(promotion_id: int, payload: PromotionRequest):
+    client = get_supabase_client()
+    existing = client.table("promotions").select("*").eq("id", promotion_id).single().execute().data
+    if not existing:
+        raise HTTPException(status_code=404, detail="Promotion not found")
+
+    row = _promotion_payload_to_row(payload)
+
+    try:
+        updated = (
+            client.table("promotions")
+            .update(row)
+            .eq("id", promotion_id)
+            .execute()
+            .data
+            or []
+        )
+    except Exception as exc:
+        logger.exception("Failed to update promotion %s: %s", promotion_id, exc)
+        raise HTTPException(status_code=500, detail=f"Failed to update promotion: {exc}") from exc
+
+    return {"success": True, "promotion": updated[0] if updated else {**existing, **row}}
+
+
+@app.delete("/promotions/{promotion_id}")
+def delete_promotion(promotion_id: int):
+    client = get_supabase_client()
+    existing = client.table("promotions").select("id").eq("id", promotion_id).single().execute().data
+    if not existing:
+        raise HTTPException(status_code=404, detail="Promotion not found")
+
+    try:
+        client.table("promotions").delete().eq("id", promotion_id).execute()
+    except Exception as exc:
+        logger.exception("Failed to delete promotion %s: %s", promotion_id, exc)
+        raise HTTPException(status_code=500, detail=f"Failed to delete promotion: {exc}") from exc
+
     return {"success": True}
 
 
@@ -777,4 +838,9 @@ def list_promotions():
     client = get_supabase_client()
     rows = client.table("promotions").select("*").execute().data or []
     return {"promotions": rows}
+
+
+@app.get("/admin/promotions")
+def list_admin_promotions():
+    return list_promotions()
 
