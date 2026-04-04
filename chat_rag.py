@@ -416,7 +416,7 @@ def _call_gemini(question: str, context: str, history: list[dict[str, str]]) -> 
     try:
         client = genai.Client(api_key=api_key)
         response = client.models.generate_content(
-            model="gemini-2.0-flash",
+            model="gemini-1.5-flash",
             contents=prompt,
             config={"temperature": 0.7},
         )
