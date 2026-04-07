@@ -20,6 +20,34 @@ DEFAULT_FALLBACK_MODELS = [
     "gemma-3-1b-it",
 ]
 
+PRODUCT_KNOWLEDGE_CONTEXT = """
+Resort AI product overview:
+- Resort AI is an operations dashboard for resort teams. It combines forecasting, staffing, scheduling, pricing, promotions, feedback, notifications, settings, exports, and audit logs in one workspace.
+- The frontend is a Next.js admin app deployed on Vercel.
+- The backend is a FastAPI service deployed on Render.
+- The frontend calls backend endpoints through app/api proxy routes.
+
+How forecasting works:
+- A forecasting model is loaded from Hugging Face and predicts upcoming room demand.
+- Forecast responses include predicted rooms, confidence bounds, occupancy percentage, demand class, and optional staffing recommendations.
+- Managers can save manual forecast overrides, and the system can reflect those in downstream operations.
+
+Operational modules available in the app:
+- Dashboard: occupancy trends, demand alerts, events/holidays, and active promotions.
+- Staff recommendations: department-level staffing suggestions and labor cost estimates.
+- Scheduling: generate, edit, and publish schedules.
+- Prediction pricing: suggested room pricing by demand, with approval flows.
+- Promotions: create, update, list, and remove promotional offers.
+- Feedback: track guest sentiment and comments.
+- Notifications and audit log: operational alerts and change history.
+- Settings/system: resort settings, staffing ratios, notification preferences, health, and backups.
+
+Chat assistant behavior:
+- The assistant can answer questions about what the app does, how modules work, and what data powers them.
+- When database rows are available, answers should be grounded in live data.
+- When a question is product or workflow oriented, answers should use this product overview.
+""".strip()
+
 
 def _forecast_horizon_from_question(question_lower: str) -> int:
     if "today" in question_lower or "tomorrow" in question_lower:
@@ -521,6 +549,7 @@ def search_relevant_data(question: str, client: Any) -> tuple[str, list[str]]:
 def _build_gemini_prompt(
     question: str,
     context: str,
+    product_context: str,
     history: list[dict[str, str]],
 ) -> str:
     history_text = "\n".join(
@@ -530,25 +559,36 @@ def _build_gemini_prompt(
     return (
         "You are Ethio-Habesha Resort AI assistant.\n"
         "Use ONLY the provided context and conversation history to answer.\n"
+        "The context contains two parts: live database context and product knowledge context.\n"
+        "Use product knowledge when the user asks about what the app does, features, workflows, or architecture.\n"
+        "If product knowledge is not relevant to the question, ignore it.\n"
+        "Prefer live database context for data-specific questions.\n"
         "If the exact date range has no rows, use the latest available records and say so explicitly.\n"
         "If data is still not available, clearly say you do not have that information.\n"
         "Be concise, professional, and helpful.\n\n"
         f"Context from database:\n{context}\n\n"
+        f"Product knowledge context:\n{product_context}\n\n"
         f"Conversation history:\n{history_text}\n\n"
         f"User question: {question}\n"
     )
 
 
-def _call_gemini(question: str, context: str, history: list[dict[str, str]]) -> str:
+def _call_gemini(
+    question: str,
+    context: str,
+    product_context: str,
+    history: list[dict[str, str]],
+) -> str:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         return (
             "GEMINI_API_KEY is not configured. "
-            "Chat response fallback: I can only return retrieved data right now.\n\n"
-            f"{context}"
+            "Chat response fallback: I can only return retrieved context right now.\n\n"
+            f"Retrieved data context:\n{context}\n\n"
+            f"Product knowledge context:\n{product_context}"
         )
 
-    prompt = _build_gemini_prompt(question, context, history)
+    prompt = _build_gemini_prompt(question, context, product_context, history)
 
     try:
         from google import genai
@@ -556,7 +596,8 @@ def _call_gemini(question: str, context: str, history: list[dict[str, str]]) -> 
         return (
             "Gemini SDK is not available in this environment. "
             "Install google-genai and redeploy.\n\n"
-            f"Retrieved context:\n{context}"
+            f"Retrieved data context:\n{context}\n\n"
+            f"Product knowledge context:\n{product_context}"
         )
 
     model_chain_env = os.getenv("GEMINI_MODEL_CHAIN", "")
@@ -603,15 +644,17 @@ def _call_gemini(question: str, context: str, history: list[dict[str, str]]) -> 
         logger.error("All Gemini models failed: %s", " | ".join(model_errors))
         return (
             "I could not reach an available Gemini model right now. "
-            "Here is the retrieved data from your database:\n\n"
-            f"{context}"
+            "Here is the retrieved context from your system:\n\n"
+            f"Retrieved data context:\n{context}\n\n"
+            f"Product knowledge context:\n{product_context}"
         )
     except Exception as exc:
         logger.exception("Gemini request failed: %s", exc)
         return (
             "I could not reach Gemini right now. "
-            "Here is the retrieved data from your database:\n\n"
-            f"{context}"
+            "Here is the retrieved context from your system:\n\n"
+            f"Retrieved data context:\n{context}\n\n"
+            f"Product knowledge context:\n{product_context}"
         )
 
 
@@ -666,12 +709,13 @@ def create_chat_router(
                     forecast_provider,
                     total_rooms=60,
                 )
+                product_context = PRODUCT_KNOWLEDGE_CONTEXT
                 if live_forecast_context:
                     context = f"{context}\n\n{live_forecast_context}"
                 if live_sources:
                     source_tables = sorted(set(source_tables).union(live_sources))
 
-                answer = _call_gemini(question, context, history)
+                answer = _call_gemini(question, context, product_context, history)
 
                 _save_chat_message(client, session_id, "assistant", answer)
                 history.append({"role": "assistant", "content": answer})
